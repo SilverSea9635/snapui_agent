@@ -23,7 +23,7 @@
                                          │  Python 工程(本服务) │
                                          │  FastAPI Agent 服务 │
                                          │  DeepSeek + RAG     │
-                                         │  PostgreSQL 会话     │
+                                         │  MySQL 会话(只读)   │
                                          │  Milvus 向量库       │
                                          └────────────────────┘
 ```
@@ -58,7 +58,7 @@ Dockerfile docker-compose.yml README.md AGENT.md CLAUDE.md
 前置条件（已满足）：
 
 - 已安装 uv（Python 3.13 由 uv 自动管理，见 `.python-version`）；
-- Docker 容器 `postgre`（PostgreSQL，`localhost:5432`）与 `milvus-standalone`（Milvus，`localhost:19530`）已运行；
+- 本机 MySQL 原生运行（OCRServer 的库 `OCRDB`，`localhost:3306`；PG 已随 C2 退役，旧的 `postgre` 容器不再需要）与 `milvus-standalone`（Milvus，`localhost:19530`）可用；Milvus 由 [`deploy/milvus/docker-compose.yml`](deploy/milvus/docker-compose.yml) 的 compose 栈提供——首次 `docker compose -f deploy/milvus/docker-compose.yml up -d`，之后在 Docker Desktop 里一键启停；
 - 项目根目录 `.env` 已声明 `DEEPSEEK_API_KEY`、`DEEPSEEK_API_BASE`、`QWEN_EMBED_API_KEY`、`QWEN_EMBED_BASE_URL`。
 
 ```bash
@@ -96,7 +96,8 @@ AGENT_PORT=8001 uv run python run.py
 | `QWEN_EMBED_BASE_URL` | （.env 提供） | Qwen 嵌入地址 |
 | `EMBED_MODEL` | `qwen3.7-text-embedding` | 嵌入模型 |
 | `EMBED_DIM` | `1024` | 向量维度 |
-| `POSTGRES_DSN` | `postgresql://postgres:admin@localhost:5432/langchain_db` | 会话库 |
+| `MYSQL_DSN` | （.env 提供） | 自有域，读写 + DDL |
+| `MYSQL_RO_DSN` | 留空则回退 `MYSQL_DSN` | 会话域，**只读** |
 | `MILVUS_URI` | `http://localhost:19530` | 向量库地址 |
 | `MILVUS_DB` | `snapui_rag` | 向量库数据库名 |
 | `MILVUS_COLLECTION` | `design_knowledge` | 向量集合名 |
@@ -148,7 +149,7 @@ event: done    data: {"conversationId":"...","stopReason":"stop","model":"...","
 event: error   data: {"error":"...","type":"internal_error"}
 ```
 
-### 2. 会话历史（PostgreSQL）
+### 2. 会话历史（MySQL：会话域归 OCRServer，本服务只读）
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |

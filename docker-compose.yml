@@ -1,14 +1,41 @@
-# SnapUI Agent 服务部署编排：app + PostgreSQL
-# Milvus 走 Zilliz Cloud 托管（2GB 小内存服务器无法自托管 Milvus standalone）
+# SnapUI Agent 服务部署编排：只跑 app 一个服务
+#
+# 为什么没有数据库服务：
+#   - C2 已把存储收敛到 MySQL，且这个库属于 OCRServer（会话域 conversations/messages 归它，
+#     本服务只读），本服务自有域的表由启动期迁移器幂等创建 —— 所以这里不能另起一个空库实例，
+#     只能指向既有的那个 MySQL。PG 已退役：原来的 postgres 服务、pgdata 卷、POSTGRES_DSN
+#     和 depends_on 门槛都已删除（见 docs/REFACTOR_PLAN.md 的 D10）。
+#   - Milvus 走 Zilliz Cloud 托管（2GB 小内存服务器无法自托管 Milvus standalone）；
+#     本地开发要 standalone 时走另一个栈 deploy/milvus/docker-compose.yml。
+#
 # 用法：在项目根目录执行  docker compose up -d --build
-# 密钥通过宿主机 .env 的 ${VAR} 插值注入，不写入镜像
+# 密钥通过宿主机 .env 的 ${VAR} 插值注入，不写入镜像（.dockerignore 已排除 .env）。
+#
+# ⚠️ 容器内的 MySQL 主机名与宿主机不同：宿主机 .env 里写 127.0.0.1（给 PM2 / 本地跑用），
+#    在容器里那指向容器自身，连不上。用 MYSQL_DSN_DOCKER / MYSQL_RO_DSN_DOCKER 一次性覆盖：
+#      MYSQL_DSN_DOCKER='mysql://user:pass@<主机>:3306/OCRDB' docker compose up -d
+#    （不设则原样透传 .env 里的 MYSQL_DSN / MYSQL_RO_DSN）
+#
+#    主机名填什么要看目标机，实测结论（2026-10-09，Docker Desktop 29.8.2）：
+#      · Linux 服务器：host.docker.internal 由下面的 extra_hosts 提供，通常可用；
+#      · macOS：host.docker.internal:3306 会**超时**（VM 网关 192.168.65.254 到宿主机 mysqld
+#        这条路被本机防火墙挡掉），改用宿主机 LAN IP 可以连通（本机实测 192.168.31.117:3306
+#        建立 TCP 成功）。这不是 compose 能修的问题，属宿主机网络/防火墙配置。
+#    另外账号也要授权容器来源，否则 MySQL 直接回
+#      1130 "Host 'x.x.x.x' is not allowed to connect to this MySQL server"。
 
 services:
   app:
     build: .
     container_name: snapui-agent
     restart: unless-stopped
+    # Linux 上让 host.docker.internal 指向宿主机（macOS/Windows 的 Docker Desktop 自带）
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
+      # ── 运行环境：production 档才启生产校验与告警；local 档会拒绝连远程 Milvus ──
+      APP_ENV: "${APP_ENV:-production}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
       # ── DeepSeek 基础模型 ──
       DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY}"
       DEEPSEEK_API_BASE: "${DEEPSEEK_API_BASE:-https://api.deepseek.com/v1}"
@@ -19,41 +46,28 @@ services:
       QWEN_EMBED_BASE_URL: "${QWEN_EMBED_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}"
       EMBED_MODEL: "${EMBED_MODEL:-qwen3.7-text-embedding}"
       EMBED_DIM: "${EMBED_DIM:-1024}"
-      # ── PostgreSQL 会话存储（compose 内部服务名）──
-      POSTGRES_DSN: "postgresql://postgres:${POSTGRES_PASSWORD:-admin}@postgres:5432/langchain_db"
+      # ── MySQL（宿主机上 OCRServer 的库，compose 不自带）──
+      # 自有域（components / component_* / conversation_turns / model_profiles）：读写 + DDL
+      MYSQL_DSN: "${MYSQL_DSN_DOCKER:-${MYSQL_DSN}}"
+      # 会话域（conversations / messages）：**必须只读**；留空则回退 MYSQL_DSN（仅便于本地）
+      MYSQL_RO_DSN: "${MYSQL_RO_DSN_DOCKER:-${MYSQL_RO_DSN:-}}"
+      # OCRServer 的 DATETIME 是本地墙钟，读取时按此时区解释再转 UTC
+      LEGACY_DB_TIMEZONE: "${LEGACY_DB_TIMEZONE:-Asia/Shanghai}"
       # ── Milvus / Zilliz Cloud 向量库 ──
       # 服务器 .env 提供 MILVUS_URI + 认证（用户名/密码 或 token）
       MILVUS_URI: "${MILVUS_URI}"
+      MILVUS_MODE: "${MILVUS_MODE:-auto}"
       MILVUS_TOKEN: "${MILVUS_TOKEN:-}"
       MILVUS_USER: "${MILVUS_USER:-}"
       MILVUS_PASSWORD: "${MILVUS_PASSWORD:-}"
       MILVUS_DB: "${MILVUS_DB:-default}"
       MILVUS_COLLECTION: "${MILVUS_COLLECTION:-design_knowledge}"
       RAG_TOP_K: "${RAG_TOP_K:-4}"
+      # ── 内部鉴权（OCRServer → 本服务）──
+      INTERNAL_AUTH_MODE: "${INTERNAL_AUTH_MODE:-off}"
+      INTERNAL_API_TOKEN: "${INTERNAL_API_TOKEN:-}"
       # ── 监听 0.0.0.0，才能被宿主机 / 反向代理访问 ──
       AGENT_HOST: "0.0.0.0"
       AGENT_PORT: "8000"
     ports:
       - "8000:8000"
-    depends_on:
-      postgres:
-        condition: service_healthy
-
-  postgres:
-    image: postgres:16
-    container_name: snapui-postgres
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-admin}
-      POSTGRES_DB: langchain_db
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d langchain_db"]
-      interval: 5s
-      timeout: 5s
-      retries: 12
-
-volumes:
-  pgdata:

@@ -1,0 +1,53 @@
+# 本地开发用 Milvus standalone —— 在 Docker Desktop 里显示为 compose 项目 `milvus`
+#
+# 为什么不再用 /Users/CodeGod/milvus/standalone_embed.sh：
+#   1) 数据改放命名卷：进 Docker VM 内部存储，GUI 的 Volumes 面板可见、可删、可重置；
+#   2) Docker Desktop 的「Run」表单无法表达 seccomp:unconfined 和 healthcheck，而这两项对
+#      Milvus 是必需的（缺 seccomp 会被默认配置拦掉系统调用），所以「点 Run 起容器」这条路走不通；
+#   3) 声明式配置随仓库版本化，GUI 里可一键启停/看日志/进终端。
+#
+# 用法（首次建栈用一次 CLI，之后全程在 Docker Desktop 图形界面操作）：
+#   docker compose -f deploy/milvus/docker-compose.yml up -d
+#   docker compose -f deploy/milvus/docker-compose.yml down      # 停并删容器，保留数据卷
+#   docker compose -f deploy/milvus/docker-compose.yml down -v   # 连数据卷一起删（彻底重置）
+#
+# 端口：19530 Milvus 服务 / 9091 指标与健康检查 / 2379 内嵌 etcd
+
+name: milvus
+
+services:
+  standalone:
+    image: milvusdb/milvus:v3.0.0
+    container_name: milvus-standalone
+    # 与上游 standalone_embed.sh 完全一致的启动方式
+    command: ["milvus", "run", "standalone"]
+    # 必需：默认 seccomp 配置会拦掉 Milvus / etcd 用到的系统调用
+    security_opt:
+      - seccomp:unconfined
+    restart: unless-stopped
+    environment:
+      ETCD_USE_EMBED: "true"
+      ETCD_DATA_DIR: /var/lib/milvus/etcd
+      ETCD_CONFIG_PATH: /milvus/configs/embedEtcd.yaml
+      COMMON_STORAGETYPE: local
+      DEPLOY_MODE: STANDALONE
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+      - "2379:2379"
+    volumes:
+      # 数据（含内嵌 etcd 的元数据）放命名卷，便于在 GUI 里整体重置
+      - milvus-data:/var/lib/milvus
+      # 以下两个是配置文件而非数据，随仓库走
+      - ./embedEtcd.yaml:/milvus/configs/embedEtcd.yaml:ro
+      - ./user.yaml:/milvus/configs/user.yaml:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      start_period: 90s
+      timeout: 20s
+      retries: 3
+
+volumes:
+  milvus-data:
+    name: milvus-data

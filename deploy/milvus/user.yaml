@@ -1,0 +1,17 @@
+# Extra config to override default milvus.yaml
+#
+# 2026-10-09 核查结论：原先放在这里的
+#     minioConfig:
+#       rootPath: ""
+# 是**无效键，从未生效过**。理由：
+#   1) 镜像内 `grep -rl minioConfig /milvus/` 命中 0 个文件；
+#   2) milvus.yaml 的层级是 `minio:`（第 96 行），正确路径是 `minio.rootPath`（默认 `files`，第 137 行），
+#      paramtable 按 `minio.rootPath` 取值，`minioConfig.rootPath` 落在另一个分支上被忽略；
+#   3) 实测容器内 /var/lib/milvus/data/ 只有 cache / stats_log / var，没有 files/ 前缀，
+#      说明生效的仍是默认值。
+# 所以「冷启动 segcoreCode=2011」不是它修的——当时的元凶是那份陈旧的 etcd 数据目录。
+#
+# 保持与上游 standalone_embed.sh 一致：本文件留空。
+# 若将来确实需要改 rootPath（例如要复用已有的 files/ 前缀数据），用下面这段（默认注释掉）：
+# minio:
+#   rootPath: ""

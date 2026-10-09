@@ -1,0 +1,31 @@
+[project]
+name = "snapui-agent"
+version = "0.1.0"
+description = "SnapUI Agent 服务"
+readme = "README.md"
+authors = [
+    { name = "TOTChan", email = "ckw990620@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "asyncmy>=0.2.16",
+    "fastapi>=0.110",
+    "langchain>=1.0",
+    "langchain-community>=0.3",
+    "langchain-core>=1.6.1",
+    "langchain-deepseek>=1.0",
+    "langchain-openai>=1.0",
+    "psycopg-pool>=3.2",
+    "psycopg[binary]>=3.1",
+    "pydantic>=2.0",
+    "pymilvus>=2.4",
+    "python-dotenv>=1.0",
+    "uvicorn[standard]>=0.29",
+]
+
+[tool.uv]
+package = false
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true

@@ -1,0 +1,59 @@
+# SnapUI Agent 服务部署编排：app + PostgreSQL
+# Milvus 走 Zilliz Cloud 托管（2GB 小内存服务器无法自托管 Milvus standalone）
+# 用法：在项目根目录执行  docker compose up -d --build
+# 密钥通过宿主机 .env 的 ${VAR} 插值注入，不写入镜像
+
+services:
+  app:
+    build: .
+    container_name: snapui-agent
+    restart: unless-stopped
+    environment:
+      # ── DeepSeek 基础模型 ──
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY}"
+      DEEPSEEK_API_BASE: "${DEEPSEEK_API_BASE:-https://api.deepseek.com/v1}"
+      DEEPSEEK_MODEL: "${DEEPSEEK_MODEL:-deepseek-flash}"
+      AVAILABLE_MODELS: "${AVAILABLE_MODELS:-deepseek-flash,deepseek-v4-pro}"
+      # ── Qwen 嵌入模型 ──
+      QWEN_EMBED_API_KEY: "${QWEN_EMBED_API_KEY}"
+      QWEN_EMBED_BASE_URL: "${QWEN_EMBED_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}"
+      EMBED_MODEL: "${EMBED_MODEL:-qwen3.7-text-embedding}"
+      EMBED_DIM: "${EMBED_DIM:-1024}"
+      # ── PostgreSQL 会话存储（compose 内部服务名）──
+      POSTGRES_DSN: "postgresql://postgres:${POSTGRES_PASSWORD:-admin}@postgres:5432/langchain_db"
+      # ── Milvus / Zilliz Cloud 向量库 ──
+      # 服务器 .env 提供 MILVUS_URI + 认证（用户名/密码 或 token）
+      MILVUS_URI: "${MILVUS_URI}"
+      MILVUS_TOKEN: "${MILVUS_TOKEN:-}"
+      MILVUS_USER: "${MILVUS_USER:-}"
+      MILVUS_PASSWORD: "${MILVUS_PASSWORD:-}"
+      MILVUS_DB: "${MILVUS_DB:-default}"
+      MILVUS_COLLECTION: "${MILVUS_COLLECTION:-design_knowledge}"
+      RAG_TOP_K: "${RAG_TOP_K:-4}"
+      # ── 监听 0.0.0.0，才能被宿主机 / 反向代理访问 ──
+      AGENT_HOST: "0.0.0.0"
+      AGENT_PORT: "8000"
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16
+    container_name: snapui-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-admin}
+      POSTGRES_DB: langchain_db
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d langchain_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  pgdata:

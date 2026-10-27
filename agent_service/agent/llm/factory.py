@@ -10,6 +10,7 @@ P0 只支持「平台级默认模型」（`.env` 提供）；用户自带模型�
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -27,7 +28,7 @@ class ModelSpec:
 
     provider: str
     model_name: str
-    api_key: str
+    api_key: str = field(repr=False)
     base_url: str
     timeout: float = 60.0
     max_retries: int = 1
@@ -37,7 +38,12 @@ class ModelSpec:
     def cache_key(self) -> str:
         """缓存键：不含明文密钥（用哈希），换 Key 即换实例，避免不同用户串用。"""
         key_hash = hashlib.sha256(self.api_key.encode()).hexdigest()[:16]
-        raw = f"{self.provider}|{self.base_url}|{self.model_name}|{key_hash}"
+        raw = json.dumps({
+            "provider": self.provider, "base_url": self.base_url,
+            "model": self.model_name, "key_hash": key_hash,
+            "timeout": self.timeout, "max_retries": self.max_retries,
+            "stream_usage": self.stream_usage, "extra_body": self.extra_body,
+        }, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(raw.encode()).hexdigest()
 
     def safe_label(self) -> str:
@@ -70,6 +76,7 @@ def build_chat_model(spec: ModelSpec) -> BaseChatModel:
     if spec.provider == "deepseek":
         from langchain_deepseek import ChatDeepSeek
 
+
         return ChatDeepSeek(
             model=spec.model_name,
             api_key=spec.api_key,
@@ -81,7 +88,11 @@ def build_chat_model(spec: ModelSpec) -> BaseChatModel:
     if spec.provider == "openai-compatible":
         from langchain_openai import ChatOpenAI
 
+        from ...core.model_http import model_clients
+        sync_client, async_client = model_clients()
         return ChatOpenAI(
+            http_client=sync_client,
+            http_async_client=async_client,
             model=spec.model_name,
             api_key=spec.api_key,
             base_url=spec.base_url,

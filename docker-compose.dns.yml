@@ -1,0 +1,7 @@
+# 云服务器容器 DNS 异常时，与主配置一起使用；仅影响 app 的运行网络。
+# 用法见 docs/DOCKER_DEPLOY.md 的 DNS 排查部分。
+services:
+  app:
+    dns:
+      - "223.5.5.5"
+      - "223.6.6.6"

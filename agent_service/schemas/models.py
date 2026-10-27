@@ -8,6 +8,7 @@ P0 只新增可选字段（`attachments` / `modelConfig`），不改既有字段
 from __future__ import annotations
 
 from typing import Any, List, Optional, Union
+from uuid import UUID
 
 from pydantic import BaseModel, Field
 
@@ -55,6 +56,17 @@ class ModelConfigIn(BaseModel):
     extraBody: Optional[dict[str, Any]] = None
 
 
+class HistoryMessage(BaseModel):
+    """上游下发的一条历史消息；检查点尚无消息时用于初始化。
+
+    `content` 刻意保持宽松：OCRServer 侧既可能是纯文本，也可能是内容块数组
+    （图片块在落库时已被剥离像素，只留 `bytes`）。本服务只用其中的文本。
+    """
+
+    role: str
+    content: Any = ""
+
+
 class ChatRequest(BaseModel):
     """POST /api/chat 请求体（与上游契约一致，仅新增可选字段）。"""
 
@@ -64,11 +76,21 @@ class ChatRequest(BaseModel):
     model: Optional[str] = None
     #: 上游鉴权后转发的用户标识（users.id 的十进制字符串）
     userId: Optional[str] = None
-    #: 新增：把组件源码引入上下文（P2 使用；P0 已解析并记录，暂不参与生成）
+    #: C3 新增：会话历史，正序，由 OCRServer 从自己的库里读出后下发（全量或最近 N 条均可）。
+    #: 启用检查点时仅在首次导入最近 20 条；后续从检查点恢复，避免重复追加。
+    history: Optional[List[HistoryMessage]] = None
+    #: 新增：把组件源码引入上下文（P2 使用；当前已解析并记录，暂不参与生成）
     attachments: Optional[List[Attachment]] = None
     #: 新增：用户自带模型（P4）
     modelConfig: Optional[ModelConfigIn] = None
     modelProfileId: Optional[str] = None
+    originalMessage: Any = None
+    messageId: Optional[UUID] = None
+    assistantMessageId: Optional[UUID] = None
+
+
+class MemoryIn(BaseModel):
+    value: str = Field(min_length=1, max_length=2000)
 
 
 class IngestRequest(BaseModel):
@@ -85,10 +107,3 @@ class SearchRequest(BaseModel):
     query: str
     top_k: int = 4
     collection: Optional[str] = None
-
-
-class CreateConversationRequest(BaseModel):
-    """创建会话（P0 起该能力归 OCRServer，本服务只保留请求模型以免破坏导入）。"""
-
-    title: str = ""
-    userId: Optional[str] = None

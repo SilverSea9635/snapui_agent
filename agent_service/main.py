@@ -2,22 +2,26 @@
 
 启动顺序（很重要）：
 1. `create_app()` 里先做**配置校验** —— 配置非法直接抛错，进程绝不进入监听状态；
-2. lifespan 打开 MySQL 双池并执行幂等迁移；
-3. 迁移失败不阻塞启动（服务可降级为「只读不可用」），但会记 error 日志并在 /health 暴露。
+2. lifespan 记录配置并探测 Milvus 连通性，失败时告警并继续启动；
+3. 初始化共享执行图及 PostgreSQL 消息、检查点和长期偏好；生产强制持久化。
 """
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import asyncio
+import time
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
 
-from .api.routers import chat, history, knowledge, system
+from .api.routers import chat, knowledge, system
 from .core.config import ConfigError, settings
 from .core.errors import AppError
 from .core.http import configure_outbound_proxy
 from .core.logging import get_logger, install_redaction
-from .repositories.mysql import mysql
+from .repositories.vector_store import vector_store
+from .agent.runtime import agent_lifespan
 
 logger = get_logger("main")
 
@@ -28,18 +32,29 @@ async def lifespan(_app: FastAPI):
     for warning in settings.warnings:
         logger.warning("配置告警：%s", warning)
 
-    await mysql.open()
+    started = time.monotonic()
+    logger.info("Milvus 启动检查开始：mode=%s db=%s", settings.milvus_mode_resolved, settings.MILVUS_DB or "默认库")
     try:
-        applied = await mysql.migrate()
-        logger.info("自有域迁移完成：%s", applied or "无变化")
+        state = await asyncio.wait_for(vector_store.aping(), timeout=3.0)
     except Exception as exc:
-        # 迁移失败不阻止启动：健康检查会暴露问题，且读路径可能仍可用
-        logger.error("数据库迁移失败（服务继续启动，/health 会显示异常）：%s", exc)
+        logger.warning(
+            "Milvus 启动检查失败：type=%s elapsed=%.2fs；服务继续启动，请检查 Milvus 配置与可用性",
+            type(exc).__name__, time.monotonic() - started,
+        )
+    else:
+        logger.info(
+            "Milvus 启动检查通过：collections=%s elapsed=%.2fs（集合按需初始化）",
+            state["collections"], time.monotonic() - started,
+        )
 
-    yield
+    async with agent_lifespan() as runtime:
+        _app.state.agent_runtime = runtime
+        try:
+            yield
+        finally:
+            del _app.state.agent_runtime
 
-    await mysql.close()
-    logger.info("已释放 MySQL 连接池")
+    logger.info("服务已退出")
 
 
 def create_app() -> FastAPI:
@@ -57,8 +72,13 @@ def create_app() -> FastAPI:
         title="SnapUI Agent Service",
         version="1.0.0",
         lifespan=lifespan,
-        description="FastAPI agent 服务：DeepSeek 生成 + Milvus 检索 + 组件资产域（MySQL）",
+        description="FastAPI Agent 服务：共享 LangGraph、动态模型路由、搜索、PostgreSQL 消息与长期记忆",
     )
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation_error_handler(_request: Request, _exc: RequestValidationError):
+        # Pydantic 默认错误含 input；自定义模型请求可能包含密钥，禁止回显。
+        return JSONResponse(status_code=422, content={"error": "请求参数格式不正确", "type": "validation_error"})
 
     @app.exception_handler(AppError)
     async def _app_error_handler(_request: Request, exc: AppError):
@@ -78,7 +98,6 @@ def create_app() -> FastAPI:
 
     app.include_router(system.router)
     app.include_router(chat.router)
-    app.include_router(history.router)
     app.include_router(knowledge.router)
     return app
 

@@ -48,15 +48,17 @@ class VectorStore:
     # ── 客户端 ──
     def _get_client(self) -> MilvusClient:
         if self._client is None:
+            logger.info("Milvus 客户端连接开始：mode=%s timeout=%ss", settings.milvus_mode_resolved, settings.MILVUS_TIMEOUT)
             kwargs: dict[str, Any] = {
                 "uri": settings.MILVUS_URI,
                 "timeout": settings.MILVUS_TIMEOUT,
             }
-            # 认证优先级：用户名/密码 > Token > 无鉴权（本地 standalone）
+            # 显式用户名/密码可用于自托管集群；Token 仅用于 cloud 模式。
+            # standalone 不携带从基础环境文件继承的云端 Token。
             if settings.MILVUS_USER and settings.MILVUS_PASSWORD:
                 kwargs["user"] = settings.MILVUS_USER
                 kwargs["password"] = settings.MILVUS_PASSWORD
-            elif settings.MILVUS_TOKEN:
+            elif settings.milvus_mode_resolved == "cloud" and settings.MILVUS_TOKEN:
                 kwargs["token"] = settings.MILVUS_TOKEN
             self._client = MilvusClient(**kwargs)
             logger.info(
@@ -145,15 +147,23 @@ class VectorStore:
         把连接/建库/建集合/装载的失败统一包成 `VectorStoreError`（→ HTTP 503），
         否则客户端只会看到一个含义不明的 500。
         """
+        name = collection or settings.MILVUS_COLLECTION
+        if self._ready.get(name):
+            return
+        started = time.monotonic()
+        logger.info("Milvus 初始化检查开始：db=%s collection=%s", settings.MILVUS_DB or "默认库", name)
         try:
             self._ensure_ready_inner(collection)
-        except VectorStoreError:
+        except VectorStoreError as exc:
+            logger.error("Milvus 初始化检查失败：collection=%s type=%s elapsed=%.2fs", name, type(exc).__name__, time.monotonic() - started)
             raise
         except Exception as exc:
+            logger.error("Milvus 初始化检查失败：collection=%s type=%s elapsed=%.2fs", name, type(exc).__name__, time.monotonic() - started)
             raise VectorStoreError(
                 "向量库初始化失败（请确认 Milvus 是否可用、MILVUS_URI/MODE/DB 是否正确）",
                 detail=f"{type(exc).__name__}: {exc}",
             ) from exc
+        logger.info("Milvus 初始化流程完成：collection=%s elapsed=%.2fs", name, time.monotonic() - started)
 
     def _ensure_ready_inner(self, collection: Optional[str] = None) -> None:
         name = collection or settings.MILVUS_COLLECTION
@@ -162,6 +172,7 @@ class VectorStore:
 
         client = self._get_client()
         self._ensure_database(client)
+        logger.info("Milvus 数据库检查通过：db=%s", settings.MILVUS_DB or "默认库")
 
         if not client.has_collection(collection_name=name):
             if name == settings.MILVUS_COMPONENT_COLLECTION:
@@ -175,7 +186,10 @@ class VectorStore:
                     max_length=64,
                 )
             logger.info("已创建 Milvus 集合 %s（dim=%d）", name, settings.EMBED_DIM)
+        else:
+            logger.info("Milvus 集合已存在：collection=%s", name)
 
+        logger.info("Milvus 集合装载检查开始：collection=%s", name)
         try:
             client.load_collection(collection_name=name)
         except Exception as exc:  # 已装载时可能抛错，不致命
@@ -183,6 +197,8 @@ class VectorStore:
 
         if not self._wait_loaded(client, name):
             logger.warning("集合 %s 未在预期时间内变为 Loaded，首次检索将重试", name)
+        else:
+            logger.info("Milvus 集合装载检查通过：collection=%s", name)
 
         self._ready[name] = True
         self._loaded_at[name] = time.monotonic()

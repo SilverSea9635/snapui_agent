@@ -50,18 +50,16 @@ class NotFound(AppError):
     safe_message = "资源不存在"
 
 
+class Gone(AppError):
+    code = "conversation_deleted"
+    http_status = 410
+    safe_message = "该会话已经删除，请创建新会话"
+
+
 class ConfigInvalid(AppError):
     code = "config_invalid"
     http_status = 500
     safe_message = "服务配置不合法，请检查启动日志"
-
-
-class SessionDomainReadOnly(AppError):
-    """会话域（conversations/messages）归 OCRServer，本服务不得写。"""
-
-    code = "session_domain_read_only"
-    http_status = 501
-    safe_message = "会话的写入与删除由后端 OCRServer 负责，本服务只读"
 
 
 class UpstreamModelError(AppError):
@@ -79,6 +77,18 @@ class VectorStoreError(AppError):
     code = "vector_store_error"
     http_status = 503
     safe_message = "向量服务暂不可用"
+
+
+class AgentStorageError(AppError):
+    code = "agent_storage_error"
+    http_status = 503
+    safe_message = "会话存储暂不可用，请稍后重试"
+
+
+class ConversationBusy(AppError):
+    code = "conversation_busy"
+    http_status = 409
+    safe_message = "该会话正在生成，请等待本轮完成后重试"
 
 
 def to_sse_payload(exc: BaseException) -> dict[str, Any]:

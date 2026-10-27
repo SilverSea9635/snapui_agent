@@ -1,216 +1,189 @@
-# SnapUI Agent 服务（Python 工程）
+# SnapUI Python 生成服务
 
-这是一个支持「图片 + 文字组合」的生成型多模态产品的 **Agent 服务**：用户上传截图 + 文字，快速产出设计稿对应的前端组件，并在前端通过 `babel/standalone` 实时预览、支持复制源码。
+本工程使用 FastAPI、LangChain 模型适配、Qwen 嵌入模型和 Milvus，为 SnapUI 提供知识检索与组件代码流式生成。目录名保留为 langchain1.2_tutorial，运行包为 agent_service。
 
-本服务是三个工作区中的 **Python 工程**，定位为下游的 agent 服务：
+当前使用共享 LangGraph 执行图，在 RAG 上下文中按轮次选择模型，支持搜索/记忆工具循环、会话恢复与跨会话偏好。组件直接复用、自动编译修复和 Subagent 属于后续规划。
 
-- 使用 **FastAPI** 对外提供 HTTP 接口，与上游 **后端工程**（`/Users/CodeGod/backend/OCRServer`）通信；
-- **存储按域分工（C2）**：会话数据（`conversations` / `messages`）归 OCRServer 的 **MySQL**，本服务**只读**；组件资产、回合元数据、模型配置等自有域表由本服务拥有（详见 `docs/DESIGN.md`）；
-- 使用 **Milvus** 管理向量数据，支持 **RAG**；
-- 基础模型使用 **DeepSeek**，嵌入模型使用 **Qwen**（`qwen3.7-text-embedding`，1024 维）。
+## 三个工程与职责
 
-## 三个工作区串联关系
-
-```
-┌──────────────┐     /api/chat(SSE)      ┌────────────────────┐   OCR/多模态   ┌────────────────┐
-│  前端工程      │ ──────────────────────▶ │  后端工程 OCRServer │ ─────────────▶ │ MiMo 视觉/OCR   │
-│ my-tsx-react- │                        │  (Node/Express)     │                └────────────────┘
-│    app        │ ◀────────────────────── │   鉴权/积分/历史     │
-└──────────────┘      SSE 流式返回        └─────────┬──────────┘
-                                                    │ 转发文本(OCR 结果 + 用户文字)
-                                                    ▼
-                                         ┌────────────────────┐
-                                         │  Python 工程(本服务) │
-                                         │  FastAPI Agent 服务 │
-                                         │  DeepSeek + RAG     │
-                                         │  MySQL 会话(只读)   │
-                                         │  Milvus 向量库       │
-                                         └────────────────────┘
+```text
+React 前端 → OCRServer（鉴权、提示词、业务数据、OSS、截图理解）
+                 │ 内部签名请求；原始输入 + 模型上下文 + 模型配置
+                 ▼
+             FastAPI（本工程，默认 8000）
+                 ├─ Qwen embeddings → Milvus 知识检索
+                 ├─ PostgreSQL：消息、事件、检查点、长期记忆
+                 └─ 平台 DeepSeek / 用户 OpenAI 兼容模型 ↔ 搜索/记忆工具 → SSE
+                 ▼
+             OCRServer 记录业务回合并转发 → 前端预览 TSX
 ```
 
-- **前端工程**：`/Users/CodeGod/front-end/my-tsx-react-app`（React + TSX，`babel/standalone` 实时预览）。
-- **后端工程**：`/Users/CodeGod/backend/OCRServer`（Node/Express，JWT 鉴权、积分、历史记录，默认 `127.0.0.1:3000`）。
-- **Python 工程**：本项目根目录（`langchain1.2_tutorial`），默认 `127.0.0.1:8000`。
+本服务不连接 MySQL。OCRServer 保存会话归属、标题、计费、作品和附件引用；Python 用 PostgreSQL 保存原始消息、助手回复、事件、检查点和用户长期偏好。生产环境必须配置数据库。API Key 不进入检查点，截图仍归 OSS；Milvus 用于知识库检索。接入与边界见 [Agent 运行时](docs/AGENT_RUNTIME.md)。
 
-> 说明：DeepSeek 为基础文本模型，无法直接读取图片像素。截图理解（OCR / 视觉描述）由后端工程的 MiMo 视觉模型完成，后端把「OCR 结果 + 用户文字」以文本转发给本服务；本服务负责 RAG 检索与组件代码生成。
+配套文档：[OCRServer README](../OCRServer/README.md)、[前端 README](../../front-end/my-tsx-react-app/README.md)。
 
-## 目录结构
+## 安装与启动
 
-```
-agent_service/         # 服务实现（P0 重写后的包）
-  run.py               # 真实入口（PM2 指向这里）
-  main.py              # FastAPI 装配：配置校验 / 生命周期 / 异常处理
-  core/                # config（分环境+启动校验）· logging（脱敏）· http（出站代理）· security（内部鉴权）· errors
-  api/                 # routers/{system,chat,history,knowledge} · sse · deps
-  services/            # chat_service（对话编排）· generation（生成流水线）· messages（消息转换）
-  agent/               # prompts · llm/{factory,cache}
-  repositories/        # mysql（双池+迁移器）· sessions（会话域只读）· turns · embeddings · vector_store
-  migrations/          # 自有域建表 SQL（启动时幂等应用）
-run.py                 # 兼容壳：转调 agent_service/run.py
-docs/                  # REFACTOR_PLAN.md（状态/决策）· DESIGN.md（设计）· archive/
-pyproject.toml uv.lock # 依赖清单与锁定
-.env / .env.local      # 密钥（基座）与本地覆盖（后者已 gitignore）
-Dockerfile docker-compose.yml README.md AGENT.md CLAUDE.md
-```
-
-## 快速开始
-
-前置条件（已满足）：
-
-- 已安装 uv（Python 3.13 由 uv 自动管理，见 `.python-version`）；
-- 本机 MySQL 原生运行（OCRServer 的库 `OCRDB`，`localhost:3306`；PG 已随 C2 退役，旧的 `postgre` 容器不再需要）与 `milvus-standalone`（Milvus，`localhost:19530`）可用；Milvus 由 [`deploy/milvus/docker-compose.yml`](deploy/milvus/docker-compose.yml) 的 compose 栈提供——首次 `docker compose -f deploy/milvus/docker-compose.yml up -d`，之后在 Docker Desktop 里一键启停；
-- 项目根目录 `.env` 已声明 `DEEPSEEK_API_KEY`、`DEEPSEEK_API_BASE`、`QWEN_EMBED_API_KEY`、`QWEN_EMBED_BASE_URL`。
+本地直接运行需要 uv、Python 3.13+；Docker 部署无需在宿主机安装它们，详见 [Docker 部署教程](docs/DOCKER_DEPLOY.md)。依赖由 pyproject.toml 声明、uv.lock 锁定。参考 .env.example 填写环境文件，模板不应携带真实凭据。
 
 ```bash
-uv sync   # 同步依赖（按 pyproject.toml + uv.lock 安装到 .venv）
-
-# 在项目根目录 langchain1.2_tutorial 下启动（两种写法等价）
+uv sync --frozen
+# 本地 Milvus：先启动 Docker
+docker compose -f deploy/milvus/docker-compose.yml up -d
+# 配置 .env / .env.local 后启动
 uv run python run.py
-uv run python -m agent_service.run
+```
 
-# 换端口/做蓝绿：进程环境优先于 .env，因此可直接覆盖
+等价入口与端口覆盖：
+
+```bash
+uv run python -m agent_service.run
 AGENT_PORT=8001 uv run python run.py
 ```
 
-> 关键环境变量（完整见 `.env.example`）：
-> `MYSQL_DSN`（自有域，读写）· `MYSQL_RO_DSN`（会话域，**只读**）· `LEGACY_DB_TIMEZONE`（OCRServer 的 DATETIME 是本地墙钟）
-> `MILVUS_URI` / `MILVUS_TOKEN` / `MILVUS_MODE`（`auto|standalone|cloud`）· `MILVUS_DB`（云端须留空或用集群内既有库名）
-> `INTERNAL_AUTH_MODE`（`off|warn|enforce`）+ `INTERNAL_API_TOKEN` · `APP_ENV`（`local|production`）· `HTTP_TRUST_ENV`/`MODEL_HTTP_PROXY`
+默认监听 127.0.0.1:8000；Node 的 AGENT_SERVICE_URL 代码默认端口为 8001，需显式与实际监听地址统一。启动入口设置 reload=False，修改 Python 代码后需重启。
 
-启动后可访问：
+## 入口与模块
 
-- `GET http://127.0.0.1:8000/` —— 服务发现（列出全部接口）；
-- `GET http://127.0.0.1:8000/health` —— 健康检查；
-- 接口文档 `GET http://127.0.0.1:8000/docs`（FastAPI 自带 Swagger）。
+启动链：`run.py → agent_service/run.py:main() → Uvicorn → agent_service/main.py:app`。
 
-## 环境变量
+| 文件或目录 | 职责 |
+| --- | --- |
+| 根 run.py | 兼容启动壳，调用包内 main |
+| agent_service/run.py | 安装日志脱敏、启动 Uvicorn、设置监听 |
+| agent_service/main.py | 配置校验、FastAPI 装配、生命周期、异常、路由 |
+| api/routers/chat.py | 内部与模型配置验签、开流前校验、自定义模型限流 |
+| api/sse.py | SSE 编码 |
+| services/chat_service.py | 单轮验证、历史规整、检索、上下文组装与生成 |
+| services/messages.py | 文本提取、图片计数、历史转换、检索片段格式化 |
+| services/generation.py | 调用模型 astream，提取增量和 usage |
+| agent/prompts.py | 缺省 system、知识上下文模板、图片提示 |
+| agent/llm/factory.py、cache.py | 模型工厂与按配置隔离的有界缓存 |
+| agent/runtime.py | 共享图、动态路由、搜索/记忆工具、流式状态 |
+| repositories/checkpoints.py、messages.py | PostgreSQL 连接、会话锁、Store、消息与事件 |
+| repositories/embeddings.py | Qwen 文本嵌入 |
+| repositories/vector_store.py | Milvus 写入、搜索、统计、本地/云端适配 |
+| core/ | 环境配置、内部鉴权、日志脱敏、安全出站、错误类型 |
+| tests/ | 模型安全与 HTTP 出站测试 |
+| deploy/milvus/ | 本地 Milvus 部署配置 |
 
-密钥统一从 **项目根目录** `langchain1.2_tutorial/.env` 加载；以下基础设施参数内置了与 Docker 默认配置一致的默认值，可按需通过环境变量覆盖（详见 `.env.example`）。
+表中 api/services/agent/repositories/core 路径均位于 agent_service 下。应用监听前校验配置，并执行 Milvus 连通性检查（等待上限 3 秒，失败记录告警后继续启动；底层同步调用仍受 MILVUS_TIMEOUT 限制）。启动日志包含检查结果与耗时；集合仍按需初始化，并记录数据库、集合和装载检查日志，随后初始化共享执行图及配置的 PostgreSQL 检查点连接。
 
-| 变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `DEEPSEEK_API_KEY` | （.env 提供） | DeepSeek API Key |
-| `DEEPSEEK_API_BASE` | `https://api.deepseek.com/v1` | DeepSeek 接口地址 |
-| `DEEPSEEK_MODEL` | `deepseek-v4-flash` | 基础模型 |
-| `QWEN_EMBED_API_KEY` | （.env 提供） | Qwen 嵌入 Key |
-| `QWEN_EMBED_BASE_URL` | （.env 提供） | Qwen 嵌入地址 |
-| `EMBED_MODEL` | `qwen3.7-text-embedding` | 嵌入模型 |
-| `EMBED_DIM` | `1024` | 向量维度 |
-| `MYSQL_DSN` | （.env 提供） | 自有域，读写 + DDL |
-| `MYSQL_RO_DSN` | 留空则回退 `MYSQL_DSN` | 会话域，**只读** |
-| `MILVUS_URI` | `http://localhost:19530` | 向量库地址 |
-| `MILVUS_DB` | `snapui_rag` | 向量库数据库名 |
-| `MILVUS_COLLECTION` | `design_knowledge` | 向量集合名 |
-| `RAG_TOP_K` | `4` | 检索 top-k |
-| `AGENT_HOST` / `AGENT_PORT` | `127.0.0.1` / `8000` | 服务监听 |
+## 配置
 
-## API 说明
+优先级：**进程环境 > .env.<APP_ENV> > .env**。APP_ENV 默认 local，支持 local/production；从配置文件位置定位工程根目录，不依赖启动 cwd。
 
-### 1. 对话生成（SSE 流式）
+| 配置 | 用途 |
+| --- | --- |
+| AGENT_HOST、AGENT_PORT | 默认 127.0.0.1、8000 |
+| DEEPSEEK_API_KEY、DEEPSEEK_API_BASE、DEEPSEEK_MODEL | 平台生成模型；代码默认模型名 deepseek-flash |
+| AVAILABLE_MODELS | 平台白名单；未知平台模型名回落默认 |
+| QWEN_EMBED_API_KEY、QWEN_EMBED_BASE_URL、EMBED_MODEL、EMBED_DIM | 嵌入服务；代码默认模型 qwen3.7-text-embedding、维度 1024 |
+| MILVUS_URI、MILVUS_MODE、MILVUS_DB、MILVUS_COLLECTION | 向量库位置、模式、库与集合 |
+| MILVUS_TOKEN 或 MILVUS_USER/MILVUS_PASSWORD | 云端认证 |
+| RAG_TOP_K | 检索数量，默认 4 |
+| POSTGRES_DSN、POSTGRES_SCHEMA | 消息、事件、检查点和长期记忆；生产必填，私有 schema 默认 agent_runtime |
+| POSTGRES_POOL_MAX_SIZE、POSTGRES_CONNECT_TIMEOUT | 连接池上限默认 5，连接等待默认 10 秒 |
+| POSTGRES_AUTO_SETUP、POSTGRES_PRUNE_CHECKPOINTS | 初始化消息/检查点/Store 表、每轮保留最新检查点；默认均开启 |
+| AGENT_WEB_SEARCH、TAVILY_API_KEY | Tavily 搜索；配置密钥时默认开启，也可显式关闭 |
+| AGENT_MAX_MODEL_CALLS、AGENT_HISTORY_MESSAGES | 每轮最多 6 次模型调用；模型输入历史目标 40 条，在用户轮次边界裁剪 |
+| INTERNAL_AUTH_MODE、INTERNAL_API_TOKEN | 内部鉴权模式及与 Node 共享的密钥 |
+| ALLOWED_MODEL_HOSTS | 自定义模型允许域名，与 Node 一致 |
+| HTTP_TRUST_ENV、MODEL_HTTP_PROXY | 平台出站配置；自定义模型另走安全客户端 |
 
-`POST /api/chat`
+以上模型名是代码默认值，实际可用名称由配置的供应商决定。嵌入维度需与集合 schema 一致。
 
-请求体（与上游后端 `/api/chat` 契约一致）：
+本地默认 standalone；local 模式阻止意外连接远程 Milvus，确需远程时设置 MILVUS_ALLOW_REMOTE_IN_LOCAL=1。云端使用已有库，MILVUS_DB 需填写集群实际库名。鉴权支持 off/warn/enforce，生产应使用 enforce；自定义模型始终需要有效签名，即使平台调用配置为 off。
+
+## 单轮对话流程
+
+1. Node 核验用户、会话、作品与附件，预留附件引用，组装可信 system 和组件上下文，并生成稳定消息 UUID。
+2. 有截图时，Node 用平台 MiMo 生成或复用描述，再把文字交给 Python。本服务不读取 OSS，也不识别图片像素。
+3. chat.py 校验内部身份与敏感配置签名，调用 validate_request；空消息在 SSE 开流前返回 HTTP 错误。
+4. Python 保存独立的原始输入，恢复检查点；缺少检查点时从 PostgreSQL 消息重建历史。
+5. 非空文本进行 Milvus 检索；异常时记录 degraded 并继续生成。命中片段以临时参考知识加入本轮模型输入，不重复保存到会话消息。
+6. 使用上游 system 或缺省提示词组装消息，按平台 model 或内部 modelConfig 选择模型。
+7. 共享执行图读取用户偏好，按本轮路由获取缓存模型，执行搜索/记忆工具循环，流式返回文本并累加用量；Python 持久化回复、状态、事件和检查点，Node 记录业务回合元数据。
+
+当前 RAG 每轮仍调用生成模型，不直接返回相似组件。Python 当前默认报告 fresh；明确调整的最终模式由 Node 按其上下文记录。
+
+## HTTP 与 SSE
+
+| 方法与路径 | 用途 |
+| --- | --- |
+| GET / | 服务发现 |
+| GET /health | 实际探测 Milvus 和已配置的 PostgreSQL，返回 ok/degraded |
+| GET /health?deep=1 | 额外调用嵌入模型并检查维度 |
+| GET /api/models | 平台模型列表和默认值 |
+| POST /api/chat | 流式生成 |
+| GET /api/agent/sessions/:id/messages | 内部消息游标分页 |
+| GET /api/agent/sessions/:id/messages/:messageId | 内部精确消息查询 |
+| DELETE /api/agent/sessions/:id | 联动清理消息、事件、检查点 |
+| GET/PUT/DELETE /api/agent/memories[/:key] | 当前用户长期偏好 |
+| POST /api/knowledge/ingest | 写入 texts 或 documents |
+| POST /api/knowledge/search | 检索 query，可指定 top_k |
+| GET /api/knowledge/stats | 集合统计 |
+| GET /docs | FastAPI 接口文档 |
+
+历史、模型配置管理、截图上传、作品 CRUD 由 OCRServer 提供。
+
+Node 下发的普通请求：
 
 ```json
 {
-  "conversationId": "可选，缺省自动生成 UUID",
-  "message": "字符串，或内容块数组",
-  "system": "可选系统提示词",
-  "model": "可选，缺省用 DEEPSEEK_MODEL",
-  "userId": "可选，上游鉴权后的用户标识"
+  "conversationId": "会话ID",
+  "userId": "已鉴权用户ID的十进制字符串",
+  "message": "用户文字、必要组件上下文及截图描述",
+  "originalMessage": "用户原始输入或稳定附件内容块",
+  "messageId": "用户消息UUID",
+  "assistantMessageId": "助手消息UUID",
+  "system": "由OCRServer组装的系统提示词"
 }
 ```
 
-`message` 支持两种形态：
+平台调用可加 model；自定义调用由 Node 内部附带 modelConfig，提供身份和配置签名。Python 不解析 modelProfileId、不读取保存的密钥。attachments 组件附件字段尚未启用，不等同于 Node 已实现的截图 attachmentId。
 
-- 纯文本：`"帮我生成一个登录卡片"`；
-- 多模态内容块数组（与前端一致）：
+```text
+event: start
+data: {"conversationId":"..."}
 
-```json
-[
-  { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "<base64>" } },
-  { "type": "text", "text": "把它做成一个登录卡片组件" }
-]
+event: delta
+data: {"text":"..."}
+
+event: done
+data: {"conversationId":"...","stopReason":"stop","model":"...","usage":null,"mode":"fresh","reused":false,"degraded":false}
 ```
 
-SSE 事件协议（与后端 OCRServer 保持一致）：
+生成失败返回 error 事件；开流前的参数和权限错误返回 HTTP JSON。模型未提供 usage 时保持 null。
 
-```
-event: start   data: {"conversationId":"..."}
-event: delta   data: {"text":"..."}
-event: delta   data: {"text":"..."}
-event: done    data: {"conversationId":"...","stopReason":"stop","model":"...","usage":null}
-```
+## 自定义模型安全
 
-异常时：
+Node 加密保存密钥，Python 在内部请求中使用。自定义地址限定允许域名、HTTPS 和公共 IP；DNS 解析后固定连接 IP，保留 TLS SNI/Host，禁止重定向与环境代理。模型缓存隔离凭据，淘汰时关闭客户端。
 
-```
-event: error   data: {"error":"...","type":"internal_error"}
-```
+每用户最多两轮并发、每分钟 20 次，是单实例内存限流。OpenAI 兼容协议不代表工具调用和多模态能力已验证。详见 [模型配置说明](../OCRServer/MODEL_PROFILES.md)。
 
-### 2. 会话历史（MySQL：会话域归 OCRServer，本服务只读）
-
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| `GET` | `/api/history?page=&pageSize=&userId=` | 分页列出会话 |
-| `GET` | `/api/history/{conversationId}?userId=` | 会话详情（含消息） |
-| `POST` | `/api/history` | 创建会话 `{"title": "", "userId": ""}` |
-| `DELETE` | `/api/history/{conversationId}?userId=` | 删除会话 |
-| `DELETE` | `/api/chat/{conversationId}?userId=` | 清除会话 |
-
-### 3. 知识库（RAG）
-
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| `POST` | `/api/knowledge/ingest` | 写入知识 `{"texts":[...]}` 或 `{"documents":[{"text":"...","source":"..."}]}` |
-| `POST` | `/api/knowledge/search` | 检索 `{"query":"...","top_k":4}` |
-| `GET` | `/api/knowledge/stats` | 集合统计 |
-
-## 快速验证（curl 示例）
+## 验证与部署
 
 ```bash
-# 健康检查
+LANGCHAIN_TRACING_V2=false LANGSMITH_TRACING=false uv run python -m unittest discover -s tests -q
+uv run python -m agent_service.ops.verify_storage
+uv run python -m agent_service.ops.verify_messages
 curl http://127.0.0.1:8000/health
-
-# 写入知识库
-curl -X POST http://127.0.0.1:8000/api/knowledge/ingest \
-  -H 'Content-Type: application/json' \
-  -d '{"texts":["按钮组件应包含圆角、主色背景与点击态","卡片组件包含标题、图片与操作按钮"]}'
-
-# 检索
-curl -X POST http://127.0.0.1:8000/api/knowledge/search \
-  -H 'Content-Type: application/json' \
-  -d '{"query":"如何设计按钮组件","top_k":2}'
-
-# 对话（SSE 流式，纯文本）
-curl -N -X POST http://127.0.0.1:8000/api/chat \
-  -H 'Content-Type: application/json' \
-  -d '{"message":"帮我生成一个登录卡片组件"}'
 ```
 
-## 与后端的对接建议
+深度检查会调用嵌入服务。开启 enforce 后，对话和知识库接口需内部签名，完整联调通过 Node，浏览器不直接提交内部凭据。
 
-后端 OCRServer 的 `services/chat.js` 目前直接调用 MiMo。接入本服务时，可把「OCR / 视觉描述」之后的结果转发到本服务：
+生产环境 Python 服务通过 Docker 独立部署；[Node PM2 配置](../OCRServer/ecosystem.config.cjs) 仅管理 OCRServer。根 docker-compose.yml 仅部署 Python app，本地 Milvus 使用独立 deploy/milvus 栈。容器部署使用独立的 `.env.docker`，默认启用内部鉴权、仅绑定宿主机回环地址；完整命令、OCRServer 联调与回退见 [Docker 部署教程](docs/DOCKER_DEPLOY.md)。
 
-```js
-// 伪代码示例（非本次改动内容）
-const resp = await fetch('http://127.0.0.1:8000/api/chat', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({
-    conversationId,
-    userId: req.user.id,
-    message: ocrResultText + '\n' + userText,  // 或原样转发内容块数组
-    system,
-  }),
-});
-// 将 resp.body（text/event-stream）透传给前端即可
-```
+后续规划见 [REFACTOR_PLAN.md](docs/REFACTOR_PLAN.md) 与 [DESIGN.md](docs/DESIGN.md)。这些文档含规划内容；当前功能以运行代码和本 README 的实现说明为准。
 
-## 设计说明
 
-- **模型实例化**：DeepSeek 使用 `init_chat_model(model='deepseek-v4-flash', model_provider='deepseek')`；嵌入模型使用 `init_embeddings(model='openai:qwen3.7-text-embedding', ...)`，与 `11_RAG/03-文档嵌入模型.ipynb` 第二个 cell 一致。
-- **会话存储（C2 变更）**：会话域归 OCRServer 的 MySQL，本服务用**只读账号**读取（`MYSQL_RO_DSN`）；创建/删除会话的接口返回 **501**，由 OCRServer 承担。本服务另有自有域表（`components*`、`conversation_turns`、`model_profiles`）。
-- **RAG 流水线**：对话文本 → 向量检索（Milvus，COSINE）→ 将命中片段作为「参考知识」注入提示词 → DeepSeek 流式生成。
-- **图像处理**：DeepSeek 为纯文本模型；本服务完整接收多模态内容块格式，图片的 OCR / 视觉描述由上游后端完成，未配置视觉模型时仅做占位提示，不影响文本生成。
+## Model client cache lifecycle
+
+Use `with get_model_cache().acquire(spec) as model:` for the entire streaming request. The context releases its reference on completion, error, cancellation or explicit stream closure. Raw untracked `get()` access is no longer supported.
+
+The cache retains up to 64 reusable entries with a 30-minute TTL from creation. LRU eviction, expiry and `clear()` immediately retire entries from reuse. Active requests keep their old client until the last lease releases; only then are the HTTP clients closed. Consequently the total number of live clients can temporarily exceed the reuse limit. This cache limit is not a request concurrency limit.
+
+Bookkeeping and same-key construction are protected by a lock. Releasing an old entry cannot remove its same-key replacement. Sync and async connection cleanup failures are logged without failing a completed request. Streaming wrappers explicitly close inner generators so early close also releases model leases.
+
+Tests (no real model calls): `.venv/bin/python -B -m unittest discover -s tests -p 'test_model_*.py'`. Includes shared active clients, the 65th entry, TTL replacements, cancellation, upstream errors, generator closure and concurrent threads.

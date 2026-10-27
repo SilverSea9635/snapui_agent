@@ -1,17 +1,17 @@
-"""模型实例缓存（有界 + TTL）。
+"""Bounded LRU/TTL client cache with reference-counted request leases.
 
-替换旧实现 `SnapUIAgent._models`：那是个**无上限、且只按模型名做 key** 的 dict。
-引入用户自带模型后，那个写法会导致两个问题：
-1. 内存无界增长；
-2. 同名模型、不同 BaseURL/Key 的实例互相串用（安全与正确性双重问题）。
-
-这里以 `ModelSpec.cache_key()`（含 base_url 与 api_key 哈希）为键，LRU + TTL 淘汰。
+Eviction removes reuse eligibility immediately. Connections are closed only
+once the last active lease releases the retired entry.
 """
 from __future__ import annotations
 
+import asyncio
 import time
 from collections import OrderedDict
-from typing import Optional
+from contextlib import contextmanager
+from dataclasses import dataclass
+from threading import Lock, RLock
+from typing import Iterator, Optional
 
 from langchain_core.language_models.chat_models import BaseChatModel
 
@@ -19,63 +19,151 @@ from ...core.logging import get_logger
 from .factory import ModelSpec, build_chat_model
 
 logger = get_logger("llm.cache")
-
 DEFAULT_MAX_ENTRIES = 64
 DEFAULT_TTL_SECONDS = 1800.0
 
 
-class ModelCache:
-    """LRU + TTL 的模型实例缓存。"""
+@dataclass(eq=False)
+class _Entry:
+    model: BaseChatModel
+    created_at: float
+    users: int = 0
+    retired: bool = False
+    disposing: bool = False
+    loop: Optional[asyncio.AbstractEventLoop] = None
 
-    def __init__(
-        self, max_entries: int = DEFAULT_MAX_ENTRIES, ttl_seconds: float = DEFAULT_TTL_SECONDS
-    ) -> None:
-        self._entries: "OrderedDict[str, tuple[BaseChatModel, float]]" = OrderedDict()
+
+class ModelCache:
+    """Reuse clients through ``with cache.acquire(spec) as model`` only."""
+
+    def __init__(self, max_entries: int = DEFAULT_MAX_ENTRIES,
+                 ttl_seconds: float = DEFAULT_TTL_SECONDS) -> None:
+        if max_entries < 1 or ttl_seconds <= 0:
+            raise ValueError("max_entries and ttl_seconds must be positive")
+        self._entries: OrderedDict[str, _Entry] = OrderedDict()
+        self._lock = RLock()
+        self._closing_tasks: set[asyncio.Task] = set()
         self.max_entries = max_entries
         self.ttl_seconds = ttl_seconds
 
-    def get(self, spec: ModelSpec) -> BaseChatModel:
+    def _retire(self, entry: _Entry, ready: list[_Entry]) -> None:
+        # Called only while holding the bookkeeping lock.
+        entry.retired = True
+        if entry.users == 0 and not entry.disposing:
+            entry.disposing = True
+            ready.append(entry)
+
+    def _expire(self, now: float, ready: list[_Entry]) -> None:
+        for key, entry in list(self._entries.items()):
+            if now - entry.created_at >= self.ttl_seconds:
+                del self._entries[key]
+                self._retire(entry, ready)
+
+    @contextmanager
+    def acquire(self, spec: ModelSpec) -> Iterator[BaseChatModel]:
+        """Pin a client for the entire request, including suspended streaming."""
         key = spec.cache_key()
-        now = time.monotonic()
-
-        cached = self._entries.get(key)
-        if cached is not None:
-            model, created_at = cached
-            if now - created_at < self.ttl_seconds:
+        ready: list[_Entry] = []
+        try:
+            with self._lock:
+                self._expire(time.monotonic(), ready)
+                entry = self._entries.get(key)
+                if entry is None:
+                    # Serialize construction as well: same-key callers share one client.
+                    model = build_chat_model(spec)
+                    try:
+                        loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        loop = None
+                    entry = _Entry(model, time.monotonic(), loop=loop)
+                    self._entries[key] = entry
                 self._entries.move_to_end(key)
-                return model
-            # 过期：丢弃后重建（同时也让旧密钥尽早离开内存）
-            self._entries.pop(key, None)
+                entry.users += 1
+                while len(self._entries) > self.max_entries:
+                    self._retire(self._entries.popitem(last=False)[1], ready)
+        finally:
+            self._dispose_all(ready)
 
-        model = build_chat_model(spec)
-        self._entries[key] = (model, now)
-        self._evict()
-        logger.info(
-            "构造模型实例 %s（缓存 %d/%d）", spec.safe_label(), len(self._entries), self.max_entries
-        )
-        return model
+        try:
+            yield entry.model
+        finally:
+            ready = []
+            with self._lock:
+                entry.users -= 1
+                expired = time.monotonic() - entry.created_at >= self.ttl_seconds
+                if expired and self._entries.get(key) is entry:
+                    del self._entries[key]
+                if entry.retired or expired:
+                    self._retire(entry, ready)
+            self._dispose_all(ready)
 
-    def _evict(self) -> None:
-        now = time.monotonic()
-        # 先清过期
-        for key in [k for k, (_m, ts) in self._entries.items() if now - ts >= self.ttl_seconds]:
-            self._entries.pop(key, None)
-        # 再按 LRU 淘汰
-        while len(self._entries) > self.max_entries:
-            self._entries.popitem(last=False)
+    def _dispose_all(self, entries: list[_Entry]) -> None:
+        # Never close connections while holding the bookkeeping lock.
+        for entry in entries:
+            self._dispose(entry)
+
+    def _dispose(self, entry: _Entry) -> None:
+        sync_client = getattr(entry.model, "http_client", None)
+        async_client = getattr(entry.model, "http_async_client", None)
+        if sync_client is not None:
+            try:
+                sync_client.close()
+            except Exception as exc:
+                logger.warning("Model sync client cleanup failed: %s", type(exc).__name__)
+        if async_client is None:
+            return
+
+        async def close_async() -> None:
+            try:
+                await async_client.aclose()
+            except Exception as exc:
+                logger.warning("Model async client cleanup failed: %s", type(exc).__name__)
+
+        def forget(task: asyncio.Task) -> None:
+            with self._lock:
+                self._closing_tasks.discard(task)
+
+        def schedule() -> None:
+            task = asyncio.create_task(close_async())
+            with self._lock:
+                self._closing_tasks.add(task)
+            task.add_done_callback(forget)
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        # A lease may be released by a different thread. Keep async cleanup on
+        # the client's original event loop while that loop is still running.
+        if entry.loop is not None and entry.loop.is_running() and entry.loop is not loop:
+            entry.loop.call_soon_threadsafe(schedule)
+        elif loop is not None:
+            schedule()
+        else:
+            asyncio.run(close_async())
 
     def clear(self) -> None:
-        self._entries.clear()
+        """Invalidate all reusable entries; active leases retain their clients."""
+        ready: list[_Entry] = []
+        with self._lock:
+            for entry in self._entries.values():
+                self._retire(entry, ready)
+            self._entries.clear()
+        self._dispose_all(ready)
 
     def size(self) -> int:
-        return len(self._entries)
+        """Number of reusable entries; retired active clients are not counted."""
+        with self._lock:
+            return len(self._entries)
 
 
 _cache: Optional[ModelCache] = None
+_cache_lock = Lock()
 
 
 def get_model_cache() -> ModelCache:
     global _cache
-    if _cache is None:
-        _cache = ModelCache()
-    return _cache
+    with _cache_lock:
+        if _cache is None:
+            _cache = ModelCache()
+        return _cache

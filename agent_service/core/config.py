@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+import re
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Optional
@@ -100,17 +101,17 @@ class Settings:
         self.PORT: int = _env_int("AGENT_PORT", 8000)
         self.LOG_LEVEL: str = _env("LOG_LEVEL", "INFO").upper()
 
-        # ── MySQL（C2：单库，按表域分工）──
-        # MYSQL_DSN：自有域（组件资产 / 回合元数据 / 模型配置），需要读写与 DDL 权限
-        self.MYSQL_DSN: str = _env("MYSQL_DSN")
-        # MYSQL_RO_DSN：会话域（conversations / messages），**必须只读**；
-        # 留空则回退 MYSQL_DSN（仅便于本地开发，生产必须给独立只读账号）
-        self.MYSQL_RO_DSN: str = _env("MYSQL_RO_DSN") or self.MYSQL_DSN
-        self.MYSQL_MIN_SIZE: int = _env_int("MYSQL_MIN_SIZE", 1)
-        self.MYSQL_MAX_SIZE: int = _env_int("MYSQL_MAX_SIZE", 10)
-        self.MYSQL_POOL_RECYCLE: int = _env_int("MYSQL_POOL_RECYCLE", 3600)
-        # OCRServer 的 DATETIME 列存的是「本地墙钟数字」，读取时按此时区解释再转 UTC
-        self.LEGACY_DB_TIMEZONE: str = _env("LEGACY_DB_TIMEZONE", "Asia/Shanghai")
+        # ── Agent 检查点；业务消息迁移前继续由 OCRServer 管理 ──
+        self.POSTGRES_DSN: str = _env("POSTGRES_DSN")
+        self.POSTGRES_SCHEMA: str = _env("POSTGRES_SCHEMA", "agent_runtime")
+        self.POSTGRES_POOL_MAX_SIZE: int = _env_int("POSTGRES_POOL_MAX_SIZE", 5)
+        self.POSTGRES_CONNECT_TIMEOUT: int = _env_int("POSTGRES_CONNECT_TIMEOUT", 10)
+        self.POSTGRES_AUTO_SETUP: bool = _env_bool("POSTGRES_AUTO_SETUP", True)
+        self.POSTGRES_PRUNE_CHECKPOINTS: bool = _env_bool("POSTGRES_PRUNE_CHECKPOINTS", True)
+        self.AGENT_MAX_MODEL_CALLS: int = _env_int("AGENT_MAX_MODEL_CALLS", 6)
+        self.AGENT_HISTORY_MESSAGES: int = _env_int("AGENT_HISTORY_MESSAGES", 40)
+        self.TAVILY_API_KEY: str = _env("TAVILY_API_KEY")
+        self.AGENT_WEB_SEARCH: bool = _env_bool("AGENT_WEB_SEARCH", bool(self.TAVILY_API_KEY))
 
         # ── Milvus（本地 standalone / 生产 Zilliz Cloud）──
         self.MILVUS_URI: str = _env("MILVUS_URI", "http://localhost:19530")
@@ -166,6 +167,7 @@ class Settings:
     # ── 校验 ──
     def validate(self) -> None:
         """启动期校验：不合法直接抛 ConfigError。"""
+        self._validate_agent()
         if self.APP_ENV not in ("local", "production"):
             raise ConfigError(f"APP_ENV 只能是 local / production，当前为 {self.APP_ENV!r}")
 
@@ -182,15 +184,6 @@ class Settings:
                 f"GENERATION_POLICY 只能是 legacy / reuse，当前为 {self.GENERATION_POLICY!r}"
             )
 
-        if not self.MYSQL_DSN:
-            raise ConfigError(
-                "缺少 MYSQL_DSN。C2 已把存储收敛到 MySQL，示例：\n"
-                "  MYSQL_DSN=mysql://user:pass@127.0.0.1:3306/OCRDB\n"
-                "  MYSQL_RO_DSN=mysql://readonly:pass@127.0.0.1:3306/OCRDB"
-            )
-        self._validate_mysql_dsn("MYSQL_DSN", self.MYSQL_DSN)
-        self._validate_mysql_dsn("MYSQL_RO_DSN", self.MYSQL_RO_DSN)
-
         self.milvus_mode_resolved = self._resolve_milvus_mode()
         self._validate_milvus()
 
@@ -202,28 +195,40 @@ class Settings:
             raise ConfigError(f"EMBED_DIM 必须为正整数，当前为 {self.EMBED_DIM}")
 
         if self.APP_ENV == "production":
-            if not _env("MYSQL_RO_DSN"):
-                self.warnings.append(
-                    "生产环境未配置 MYSQL_RO_DSN：会话域将用可写账号读取。"
-                    "请为 conversations/messages 建独立只读账号（C2 禁令：本服务不得写会话域）"
-                )
             if self.INTERNAL_AUTH_MODE != "enforce":
                 self.warnings.append(
                     f"生产环境 INTERNAL_AUTH_MODE={self.INTERNAL_AUTH_MODE}，"
                     "userId 可被伪造；联调完成后应切到 enforce"
                 )
 
-    @staticmethod
-    def _validate_mysql_dsn(key: str, dsn: str) -> None:
-        parts = urlsplit(dsn)
-        if parts.scheme not in ("mysql", "mysql+asyncmy"):
-            raise ConfigError(
-                f"{key} 的 scheme 必须是 mysql://（当前 {parts.scheme or '空'}）：{key}={dsn.split('@')[-1]}"
-            )
-        if not parts.hostname:
-            raise ConfigError(f"{key} 缺少主机名")
-        if not parts.path or parts.path == "/":
-            raise ConfigError(f"{key} 缺少数据库名")
+    def _validate_agent(self) -> None:
+        reserved = {"public", "auth", "storage", "information_schema", "extensions", "vault", "realtime", "graphql_public"}
+        if (
+            not re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", self.POSTGRES_SCHEMA)
+            or self.POSTGRES_SCHEMA.startswith("pg_") or self.POSTGRES_SCHEMA in reserved
+        ):
+            raise ConfigError("POSTGRES_SCHEMA 必须是独立的私有 schema 名称，例如 agent_runtime")
+        if self.POSTGRES_POOL_MAX_SIZE < 2 or self.POSTGRES_CONNECT_TIMEOUT <= 0:
+            raise ConfigError("POSTGRES_POOL_MAX_SIZE 至少为 2，POSTGRES_CONNECT_TIMEOUT 必须为正整数")
+        if self.AGENT_MAX_MODEL_CALLS < 1 or self.AGENT_HISTORY_MESSAGES < 2:
+            raise ConfigError("AGENT_MAX_MODEL_CALLS 至少为 1，AGENT_HISTORY_MESSAGES 至少为 2")
+        if self.AGENT_WEB_SEARCH and not self.TAVILY_API_KEY:
+            raise ConfigError("AGENT_WEB_SEARCH=true 时必须配置 TAVILY_API_KEY")
+        if not self.POSTGRES_DSN and self.APP_ENV == "production":
+            raise ConfigError("生产消息服务必须配置 POSTGRES_DSN，避免生成回复后无法保存消息")
+        if not self.POSTGRES_DSN:
+            return
+        from psycopg.conninfo import conninfo_to_dict
+        try:
+            params = conninfo_to_dict(self.POSTGRES_DSN)
+        except Exception:
+            raise ConfigError("POSTGRES_DSN 格式不正确，请使用 PostgreSQL 连接串并对密码进行 URL 编码") from None
+        if any(marker in self.POSTGRES_DSN for marker in ("YOUR-PASSWORD", "YOUR_PASSWORD", "[PASSWORD]", "[project-ref]")):
+            raise ConfigError("POSTGRES_DSN 中仍有示例占位符，请填写实际数据库连接信息")
+        if "pooler.supabase.com" in params.get("host", "") and params.get("port") == "6543":
+            raise ConfigError("请使用 Supabase Direct connection 或 Session pooler（5432）；会话锁不支持 Transaction pooler")
+        if self.APP_ENV == "production" and self.INTERNAL_AUTH_MODE != "enforce":
+            raise ConfigError("启用 PostgreSQL 会话持久化的生产环境必须使用 INTERNAL_AUTH_MODE=enforce")
 
     def _resolve_milvus_mode(self) -> str:
         if self.MILVUS_MODE != "auto":
@@ -268,16 +273,19 @@ class Settings:
 
     # ── 只读视图（日志与 /health 使用，绝不输出密钥）──
     def to_safe_dict(self) -> dict:
-        def dsn_host(dsn: str) -> str:
-            parts = urlsplit(dsn)
-            return f"{parts.hostname}:{parts.port or 3306}{parts.path}"
-
         return {
             "appEnv": self.APP_ENV,
             "envFile": self.ENV_FILE or "(未找到 .env)",
             "host": self.HOST,
             "port": self.PORT,
-            "mysql": {"rw": dsn_host(self.MYSQL_DSN), "ro": dsn_host(self.MYSQL_RO_DSN)},
+            # 只报告后端类型，不输出消息、偏好或数据库连接信息。
+            "storage": "postgres" if self.POSTGRES_DSN else "none",
+            "agent": {
+                "checkpointBackend": "postgres" if self.POSTGRES_DSN else "none",
+                "webSearch": self.AGENT_WEB_SEARCH,
+                "maxModelCalls": self.AGENT_MAX_MODEL_CALLS,
+                "pruneCheckpoints": self.POSTGRES_PRUNE_CHECKPOINTS,
+            },
             "milvus": {
                 "uri": self.MILVUS_URI,
                 "mode": self.milvus_mode_resolved,

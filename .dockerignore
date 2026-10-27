@@ -1,12 +1,18 @@
 .git
-.gitignore
 .idea
+.vscode
 .claude
+.codex
+.agents
 .DS_Store
-.env
+# 排除所有环境密钥，模板无需进入构建上下文。
+.env*
 .venv
 venv
-__pycache__
+.uv-cache
 **/__pycache__
-**/*.pyc
-*.pyc
+**/*.py[cod]
+*.log
+tests
+docs
+deploy

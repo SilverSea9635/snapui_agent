@@ -21,3 +21,6 @@ env/
 
 # uv 本地缓存（沙箱环境下 uv 无法写全局缓存）
 .uv-cache/
+
+# Docker 部署密钥
+.env.docker

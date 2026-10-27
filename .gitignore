@@ -24,3 +24,14 @@ env/
 
 # Docker 部署密钥
 .env.docker
+
+# 测试脚本
+tests
+
+# AI文档
+CLAUDE.md
+AGENT.md
+README.md
+docs/
+# uv描述
+pyproject.toml
